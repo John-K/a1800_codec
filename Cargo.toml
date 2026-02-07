@@ -6,7 +6,7 @@ edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/John-K/a1800_codec"
-keywords = ["audio", "codec", "encoder", "decoder", "wav", "a1800", "GeneralPlus", "SunPlus", "furby"]
+keywords = ["audio", "codec", "a1800", "GeneralPlus", "SunPlus"]
 categories = ["compression", "encoding", "game-development", "multimedia::audio" ]
 
 [dependencies]
