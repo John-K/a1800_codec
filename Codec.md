@@ -479,8 +479,7 @@ Initially extracted as 32 entries. The gain decoder accesses indices up to ~53 (
 - **What frame sizes other than 320 are valid?** The filterbank has a `frame_size` parameter and special-cases 320 with a final ×2 scaling. Other sizes may exist but are untested.
 
 ### Encoder Side
-- **The encoder is implemented in Rust** and round-trip works for bitrates 4800–24000 bps. The 32000 bps rate has a known limitation where the forward quantizer produces all-zero symbols due to the analysis filter's windowed overlap not perfectly matching the DLL's complex pointer arithmetic.
-- **FILTERBANK_COEFF_5** (640 entries at 0x1000C970): Used by the forward filterbank's stage 0 reconstruction. The forward filterbank uses 6 coefficient tables (FWD_FILTERBANK_COEFF_0..5) vs. the inverse's 5 (FILTERBANK_COEFF_0..4). FWD_COEFF_5 has double the entries of COEFF_4 (640 vs 320).
+- **The encoder is implemented in Rust** with several known differences from the DLL (see Section 12). Round-trip works for bitrates 4800–24000 bps. The 32000 bps rate produces all-zero decoded output due to accumulated differences in the forward filterbank, analysis filter windowing, and forward quantization.
 - **The 4-bit frame parameter** encodes the number of swap operations from `optimize_bit_allocation`'s swap log that should be replayed on the decoder side.
 - **Encoder scale_param consistency**: The encoder computes scale_param from the analysis filter, but must also recompute it from gain indices using the decoder's algorithm (`compute_scale_param_from_gains`) so the encoder and decoder agree on the value.
 
@@ -532,7 +531,87 @@ Initially extracted as 32 entries. The gain decoder accesses indices up to ~53 (
 
 ---
 
-## 12. Rust Implementation Structure
+## 12. Known Differences Between Rust and DLL Implementations
+
+The decoder is believed to be bit-exact with the DLL (not yet verified with real .a18 files). The encoder has several known deviations. Round-trip encode→decode works for bitrates 4800–24000 bps. At 32000 bps the forward quantizer produces all-zero symbols.
+
+### 12.1. Forward Filterbank Phase Ordering
+
+**DLL** (`forward_filterbank` at 0x10002280): Butterfly stages 0→4, then cosine modulation, then reconstruction stages 4→0. This is the **same order** as the inverse filterbank, just with different coefficients and arithmetic (pre-scaling, no L_shl wrappers).
+
+**Rust** (`filterbank::forward`): Reconstruction stages 0→4, then cosine modulation, then butterfly stages 0→4. The order is **reversed** relative to the DLL.
+
+**Impact**: This is likely the most significant difference. Both the forward and inverse DLL filterbanks use butterfly→cosine→reconstruct order. Our forward uses reconstruct→cosine→butterfly. The round-trip works because our encoder and decoder use matching (if non-standard) filterbanks, but the encoded bitstream would not be compatible with the DLL's decoder.
+
+### 12.2. Analysis Filter Windowed Overlap
+
+**DLL** (`analysis_filter` at 0x10004ba0): Uses shared pointer variables (`psVar15`, `psVar16`) that advance through both the first and second windowing loops. The pointer arithmetic across the two loops is entangled — the second loop's window indices depend on where the first loop's pointers ended up.
+
+**Rust** (`analysis::analysis_filter`): Uses a simplified symmetric index formulation:
+```
+Loop 1: WINDOW[half-1-k] * memory[half-1-k] + WINDOW[half+k] * memory[half+k]
+Loop 2: WINDOW[half-1-k] * pcm[k] + negate(...) * pcm[n-1-k]
+```
+This approximates but does not exactly reproduce the DLL's complex pointer progression.
+
+### 12.3. Analysis Filter Memory Copy
+
+**DLL**: Copies all 320 pcm_input samples into the memory buffer for next-frame overlap.
+
+**Rust**: Copies only the second half (160 samples): `memory[..160] = pcm_input[160..320]`.
+
+**Impact**: On multi-frame encoding, the windowed overlap will accumulate differences. This could contribute to the 32000 bps failure.
+
+### 12.4. Forward Quantize Algorithm
+
+**DLL** (`forward_quantize` at 0x10004730): Uses a formula-based quantization in O(1) per sample:
+```
+scale = L_shr(L_shr(L_add(L_shr(L_mult(QUANT_SCALE_FACTOR[step],
+        QUANT_SCALE_BY_GAIN[gain]), 1), 0x1000), 0xd), 2)
+level = extract_l(L_shr(L_add(L_shr(L_mult(abs(sample), scale), 1),
+        QUANT_ROUNDING[step]), 0xd))
+if level > QUANT_INV_STEP[step]: level = QUANT_INV_STEP[step]
+```
+Uses the QUANT_SCALE_FACTOR, QUANT_SCALE_BY_GAIN, and QUANT_ROUNDING tables.
+
+**Rust** (`encoder::forward_quantize`): Uses nearest-neighbor search in O(num_levels) per sample:
+```
+for level in 1..num_levels:
+    if abs(sample - QUANT_RECON_LEVELS[step][level]) < best_dist:
+        best_level = level
+```
+
+**Impact**: Both approaches should produce similar quantization decisions, but will differ at decision boundaries due to the DLL's rounding formula vs. our midpoint-based nearest-neighbor. The `_scale` parameter is currently unused in our implementation.
+
+### 12.5. Forward Quantize Bitpacking
+
+**DLL**: `forward_quantize` packs Huffman codes and sign bits directly into 32-bit accumulators within the function, writing completed words to the output buffer as they fill. The function handles both quantization and bitstream generation in a single pass.
+
+**Rust**: `encode_subframes` stores tuples of (width, code, num_signs, sign_bits) per subframe into `encoded_data`. A separate `write_bitstream` function then packs these into the output i16 words. Functionally equivalent but structurally different.
+
+### 12.6. Frame Parameter Selection
+
+**DLL** (`encode_subframes` at 0x100043e0): Starts at the midpoint (7 increments from scratch), encodes all subbands, then binary-searches:
+- If total encoded bits < budget: undoes increments (frame_param--), re-encoding affected subbands
+- If total encoded bits > budget: adds increments (frame_param++), re-encoding affected subbands
+
+This uses actual Huffman-encoded bit counts for precise budget fitting.
+
+**Rust** (`encoder::select_frame_param`): Iterates from frame_param=0 upward, computing the BIT_ALLOC_COST total at each step. Returns the minimum frame_param where estimated cost ≤ budget. Encodes only once with the final allocation.
+
+**Impact**: The DLL's approach is more precise because it uses actual encoded bit counts. Ours uses the same cost model as the bit allocator (BIT_ALLOC_COST table), which is a good estimate but may differ from actual Huffman code lengths.
+
+### 12.7. FWD_FILTERBANK_COEFF_5 (640 entries)
+
+**DLL**: The FWD_FILTERBANK_COEFF_PTRS table has 6 entries, but the forward filterbank reconstruction loop only iterates 5 stages (4→0), using PTRS[0..4]. COEFF_5 (640 entries) is never accessed.
+
+**Rust**: COEFF_5 is declared in tables.rs but not used by `filterbank::forward`.
+
+**Status**: Either COEFF_5 is dead data, or it's used by a frame size other than 320 that we haven't encountered.
+
+---
+
+## 13. Rust Implementation Structure
 
 ```
 src/
@@ -553,7 +632,7 @@ src/
 
 ---
 
-## 13. CLI Usage
+## 14. CLI Usage
 
 ```
 a1800_codec decode <input.a18> <output.wav> [--sample-rate N]

@@ -6,7 +6,7 @@
 
 use crate::analysis;
 use crate::bitstream::BitstreamWriter;
-use crate::decoder::compute_bit_alloc_for_frame;
+use crate::decoder::{compute_bit_alloc_for_frame, increment_allocation_bins};
 use crate::fixedpoint::*;
 use crate::tables::*;
 
@@ -115,6 +115,15 @@ impl EncoderState {
             &mut scratch,
         );
 
+        // Step 2b: Select frame_param — find the minimum number of scratch
+        // increments needed so that the BIT_ALLOC_COST total fits the budget.
+        // Each increment raises a subband's step (fewer bits). The base alloc
+        // is the most generous (most bits); we increment until it fits.
+        let frame_param = select_frame_param(&alloc, &scratch, ns, remaining_bits);
+
+        // Step 2c: Apply frame_param increments to alloc
+        increment_allocation_bins(frame_param, &mut alloc[..ns], &scratch);
+
         // Step 3: Adjust gain indices for quantization using decoder-consistent sp
         let offset = add(shl(decoder_sp, 1), 0x18);
         for i in 0..ns {
@@ -127,14 +136,13 @@ impl EncoderState {
         // Step 5: Encode subframes
         let mut encoded_data = [0i16; 560];
         let mut subband_bits = [0i16; MAX_SUBBANDS];
-        let frame_param = encode_subframes(
+        encode_subframes(
             subbands,
             &alloc,
             &gain_indices,
             ns,
             &mut encoded_data,
             &mut subband_bits,
-            &scratch,
         );
 
         // Step 6: Write bitstream
@@ -333,9 +341,49 @@ fn prescale_subbands(
     }
 }
 
+/// Select frame_param: find the minimum number of scratch increments
+/// so that the BIT_ALLOC_COST total fits within the budget.
+///
+/// The base alloc is the most generous (lowest steps, most bits).
+/// Each increment from scratch raises a subband's step, reducing cost.
+/// We want the smallest frame_param (0-15) where cost <= budget.
+fn select_frame_param(alloc: &[i16; MAX_SUBBANDS], scratch: &[i16], num_subbands: usize, budget: i16) -> i16 {
+    // Compute base cost (frame_param = 0)
+    let mut cost: i16 = 0;
+    let mut working = [0i16; MAX_SUBBANDS];
+    for i in 0..num_subbands {
+        working[i] = alloc[i];
+        cost = add(cost, BIT_ALLOC_COST[alloc[i] as usize]);
+    }
+
+    // If base already fits, no increments needed
+    if sub(cost, budget) <= 0 {
+        return 0;
+    }
+
+    // Apply increments one at a time until cost fits
+    for k in 0..15i16 {
+        let sb = scratch[k as usize] as usize;
+        if sb >= num_subbands {
+            break;
+        }
+        let old_step = working[sb];
+        if sub(old_step, 7) < 0 {
+            cost = sub(cost, BIT_ALLOC_COST[old_step as usize]);
+            working[sb] = add(old_step, 1);
+            cost = add(cost, BIT_ALLOC_COST[working[sb] as usize]);
+        }
+        if sub(cost, budget) <= 0 {
+            return add(k, 1);
+        }
+    }
+
+    // Still over budget after max increments — use 15
+    15
+}
+
 /// Encode subframes: quantize and Huffman-encode each subband.
 /// Matches `encode_subframes` at 0x100043e0.
-/// Returns the frame_param (0-15) for bit allocation adjustment.
 fn encode_subframes(
     subbands: &[i16],
     alloc: &[i16; MAX_SUBBANDS],
@@ -343,8 +391,7 @@ fn encode_subframes(
     num_subbands: usize,
     encoded_data: &mut [i16],
     subband_bits: &mut [i16; MAX_SUBBANDS],
-    scratch: &[i16],
-) -> i16 {
+) {
     let mut enc_pos = 0usize;
 
     for sb in 0..num_subbands {
@@ -388,12 +435,6 @@ fn encode_subframes(
             subband_bits[sb] = add(subband_bits[sb], total_width);
         }
     }
-
-    // Determine frame_param by checking how many scratch increments
-    // are actually used by the encoded data. For now, use 0.
-    // TODO: Refine frame_param selection based on actual bit usage vs budget
-    let _ = scratch;
-    0
 }
 
 /// Forward quantize samples into a symbol and sign bits.
@@ -757,6 +798,39 @@ mod tests {
         // Allow some deviation since it's lossy, but second pass should be close
         assert!(max_diff < 5000,
             "idempotent roundtrip max diff = {}, expected < 5000", max_diff);
+    }
+
+    #[test]
+    fn test_select_frame_param() {
+        // With a very large budget, frame_param should be 0 (base alloc fits)
+        let mut alloc = [0i16; MAX_SUBBANDS];
+        let scratch = [0i16; 32];
+        alloc[0] = 2; // cost 43
+        alloc[1] = 3; // cost 37
+        // total cost = 43 + 37 = 80
+        let fp = select_frame_param(&alloc, &scratch, 2, 100);
+        assert_eq!(fp, 0, "should be 0 when base alloc fits");
+
+        // With a tight budget, should need increments
+        // BIT_ALLOC_COST = [52, 47, 43, 37, 29, 22, 16, 0]
+        // base: alloc[0]=0 (52), alloc[1]=0 (52) → total 104
+        // scratch[0]=0: alloc[0] → 1 (47), total 99
+        // scratch[1]=1: alloc[1] → 1 (47), total 94
+        let mut alloc2 = [0i16; MAX_SUBBANDS];
+        alloc2[0] = 0;
+        alloc2[1] = 0;
+        let scratch2: [i16; 32] = {
+            let mut s = [0i16; 32];
+            s[0] = 0; // increment subband 0
+            s[1] = 1; // increment subband 1
+            s
+        };
+        let fp2 = select_frame_param(&alloc2, &scratch2, 2, 100);
+        assert_eq!(fp2, 1, "one increment should bring cost from 104 to 99 (≤100)");
+
+        // budget 95: two increments bring cost from 104 to 94 (≤95)
+        let fp3 = select_frame_param(&alloc2, &scratch2, 2, 95);
+        assert_eq!(fp3, 2, "two increments bring cost from 104 to 94 (≤95)");
     }
 
     #[test]
