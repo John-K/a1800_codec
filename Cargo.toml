@@ -1,0 +1,10 @@
+[package]
+name = "a1800_codec"
+version = "0.1.0"
+description = "A clean room implementation of the GeneralPlus A1800 audio codec"
+edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/John-K/a1800_codec"
+
+[dependencies]
