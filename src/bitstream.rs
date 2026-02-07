@@ -96,17 +96,23 @@ impl<'a> BitstreamWriter<'a> {
     /// Write `width` bits from the low bits of `value`, MSB-first.
     pub fn write_bits(&mut self, value: i16, width: i16) {
         let mut remaining = width;
-        let mut val = (value as u16) & ((1u16 << (width as u32)) - 1);
+        let mask = if width >= 16 { u16::MAX } else { (1u16 << (width as u32)) - 1 };
+        let mut val = (value as u16) & mask;
 
         while remaining > 0 {
             if remaining >= self.bits_free {
                 // Fill current word and emit
                 let shift = remaining - self.bits_free;
-                self.accumulator |= (val >> (shift as u32)) & ((1u16 << (self.bits_free as u32)) - 1);
+                let bf_mask = if self.bits_free >= 16 { u16::MAX } else { (1u16 << (self.bits_free as u32)) - 1 };
+                self.accumulator |= (val >> (shift as u32)) & bf_mask;
+                if self.pos >= self.data.len() {
+                    return; // frame full — stop writing (matches DLL behavior)
+                }
                 self.data[self.pos] = self.accumulator as i16;
                 self.pos += 1;
                 remaining = sub(remaining, self.bits_free);
-                val &= (1u16 << (remaining as u32)) - 1;
+                let rem_mask = if remaining >= 16 { u16::MAX } else { (1u16 << (remaining as u32)) - 1 };
+                val &= rem_mask;
                 self.accumulator = 0;
                 self.bits_free = 16;
             } else {
@@ -121,7 +127,7 @@ impl<'a> BitstreamWriter<'a> {
 
     /// Flush any remaining partial word.
     pub fn flush(&mut self) {
-        if self.bits_free < 16 {
+        if self.bits_free < 16 && self.pos < self.data.len() {
             self.data[self.pos] = self.accumulator as i16;
             self.pos += 1;
             self.accumulator = 0;

@@ -84,22 +84,26 @@ pub fn inverse(input: &[i16], output: &mut [i16], frame_size: i16) {
 ///
 /// Converts time-domain input into frequency-domain subband output.
 /// Matches `forward_filterbank` / `FUN_10002280` at address 0x10002280 in the DLL.
+///
+/// DLL order: butterfly(stages 0–4) → cosine modulation → reconstruction(stages 4–0).
+/// All butterfly stages use 32-bit precision (L_shr before L_add/L_sub).
 pub fn forward(input: &[i16], output: &mut [i16], frame_size: i16) {
     let n = frame_size as usize;
     let mut buf_a = [0i16; 320];
     let mut buf_b = [0i16; 320];
 
-    // ── Phase 1: 5-stage reconstruction with forward filterbank coefficients ─
-    // Stages 0→4, each using its own forward coefficient table.
-    // Unlike inverse, forward does not apply extract_h(l_shl(..., 1)) — it uses extract_h(l_mac(...)) directly.
-    fwd_reconstruct(input, &mut buf_a, n, 0, &FWD_FILTERBANK_COEFF_4);
-    fwd_reconstruct(&buf_a, &mut buf_b, n, 1, &FWD_FILTERBANK_COEFF_3);
-    fwd_reconstruct(&buf_b, &mut buf_a, n, 2, &FWD_FILTERBANK_COEFF_2);
-    fwd_reconstruct(&buf_a, &mut buf_b, n, 3, &FWD_FILTERBANK_COEFF_1);
-    fwd_reconstruct(&buf_b, &mut buf_a, n, 4, &FWD_FILTERBANK_COEFF_0);
+    // ── Phase 1: 5-stage butterfly (all 32-bit precision) ────────────
+    // Reads pairs sequentially from source, writes sums to front and diffs to back.
+    // Uses L_shr before L_add/L_sub (pre-scaling to avoid overflow).
+    fwd_butterfly_32(input, &mut buf_a, n, 0);
+    fwd_butterfly_32(&buf_a, &mut buf_b, n, 1);
+    fwd_butterfly_32(&buf_b, &mut buf_a, n, 2);
+    fwd_butterfly_32(&buf_a, &mut buf_b, n, 3);
+    fwd_butterfly_32(&buf_b, &mut buf_a, n, 4);
+    // Result in buf_a.
 
     // ── Phase 2: Cosine modulation ───────────────────────────────────
-    // Same structure as inverse but uses FWD_COSINE_MOD_MATRIX and extract_h(acc) directly.
+    // Uses FWD_COSINE_MOD_MATRIX and extract_h(acc) directly (no L_shr).
     for g in 0..32usize {
         for k in 0..10usize {
             let mut acc: i32 = 0;
@@ -112,56 +116,45 @@ pub fn forward(input: &[i16], output: &mut [i16], frame_size: i16) {
 
     buf_a[..n].copy_from_slice(&buf_b[..n]);
 
-    // ── Phase 3: 5-stage butterfly ──────────────────────────────────
-    // Stage 0: 32-bit precision with pre-scaling (l_shr then l_add/l_sub)
-    {
-        let mut dst_pos = 0usize;
-        let mut front = 0usize;
-        let mut back = n;
-        while front < back {
-            back -= 1;
-            let a = buf_a[front] as i32;
-            let c = buf_a[back] as i32;
-            front += 1;
-
-            let a_shr = l_shr(a, 1);
-            let c_shr = l_shr(c, 1);
-
-            output[dst_pos] = extract_l(l_add(a_shr, c_shr));
-            output[dst_pos + 1] = extract_l(l_sub(a_shr, c_shr));
-            dst_pos += 2;
-        }
-    }
-
-    // Stages 1–4: 32-bit precision with pre-scaling
-    fwd_butterfly(&output[..n], &mut buf_a, n, 1);
-    fwd_butterfly(&buf_a, &mut buf_b, n, 2);
-    fwd_butterfly(&buf_b, &mut buf_a, n, 3);
-    fwd_butterfly(&buf_a, output, n, 4);
+    // ── Phase 3: 5-stage reconstruction with forward filterbank coefficients ─
+    // Stages 4→0, using FWD_FILTERBANK_COEFF_PTRS[0..4] = COEFF_0..COEFF_4.
+    // Uses extract_h(l_mac(...)) directly (no l_shl).
+    // Last stage (stage 0) writes to output.
+    fwd_reconstruct(&buf_a, &mut buf_b, n, 4, &FWD_FILTERBANK_COEFF_0);
+    fwd_reconstruct(&buf_b, &mut buf_a, n, 3, &FWD_FILTERBANK_COEFF_1);
+    fwd_reconstruct(&buf_a, &mut buf_b, n, 2, &FWD_FILTERBANK_COEFF_2);
+    fwd_reconstruct(&buf_b, &mut buf_a, n, 1, &FWD_FILTERBANK_COEFF_3);
+    fwd_reconstruct(&buf_a, output, n, 0, &FWD_FILTERBANK_COEFF_4);
 }
 
-/// Forward butterfly for stages 1–4.
+/// Forward butterfly for all stages (0–4).
 ///
-/// Each group of `group_size` elements: sums from front+back, differences from front-back.
-/// Uses 32-bit precision with pre-scaling (l_shr before l_add/l_sub).
-fn fwd_butterfly(src: &[i16], dst: &mut [i16], n: usize, stage: i16) {
-    let group_size = shr(n as i16, stage) as usize;
-    let num_groups = shl(1, stage) as usize;
+/// Reads pairs sequentially from source, writes sums to front and diffs to back
+/// of each group in the destination. All stages use 32-bit precision with
+/// pre-scaling (L_shr before L_add/L_sub).
+///
+/// Same read/write pattern as the inverse butterfly_16, but with 32-bit arithmetic.
+fn fwd_butterfly_32(src: &[i16], dst: &mut [i16], n: usize, stage: usize) {
+    let group_size = n >> stage;
+    let num_groups = 1usize << stage;
 
-    let mut dst_pos = 0usize;
+    let mut src_pos = 0usize;
     for g in 0..num_groups {
         let base = g * group_size;
         let mut front = base;
         let mut back = base + group_size;
         while front < back {
-            back -= 1;
-            let a = l_shr(src[front] as i32, 1);
-            let c = l_shr(src[back] as i32, 1);
-            front += 1;
+            let a = src[src_pos] as i32;
+            let b = src[src_pos + 1] as i32;
+            src_pos += 2;
 
-            dst[dst_pos] = extract_l(l_add(a, c));
-            dst[dst_pos + 1] = extract_l(l_sub(a, c));
-            dst_pos += 2;
+            let a_shr = l_shr(a, 1);
+            let b_shr = l_shr(b, 1);
+
+            back -= 1;
+            dst[front] = extract_l(l_add(a_shr, b_shr));
+            front += 1;
+            dst[back] = extract_l(l_sub(a_shr, b_shr));
         }
     }
 }
@@ -359,6 +352,45 @@ mod tests {
 
         assert_eq!(buf[0], expected_sum);
         assert_eq!(buf[319], expected_diff);
+    }
+
+    #[test]
+    fn test_forward_inverse_roundtrip() {
+        // forward then inverse should approximately recover the original signal
+        let mut input = [0i16; 320];
+        for i in 0..320 {
+            let t = i as f64 / 16000.0;
+            input[i] = (5000.0 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()) as i16;
+        }
+
+        let mut subbands = [0i16; 320];
+        forward(&input, &mut subbands, 320);
+
+        let sub_max = subbands.iter().map(|&s| (s as i32).abs()).max().unwrap();
+        let sub_nz = subbands.iter().filter(|&&s| s != 0).count();
+        eprintln!("forward: max={} nonzero={}/320", sub_max, sub_nz);
+
+        let mut output = [0i16; 320];
+        inverse(&subbands, &mut output, 320);
+
+        let out_max = output.iter().map(|&s| (s as i32).abs()).max().unwrap();
+        eprintln!("inverse: max={}", out_max);
+
+        // Check correlation
+        let mut cov = 0.0f64;
+        let mut var_in = 0.0f64;
+        let mut var_out = 0.0f64;
+        for i in 0..320 {
+            let a = input[i] as f64;
+            let b = output[i] as f64;
+            cov += a * b;
+            var_in += a * a;
+            var_out += b * b;
+        }
+        let corr = cov / (var_in.sqrt() * var_out.sqrt() + 1e-10);
+        let ratio = (var_out / var_in).sqrt();
+        eprintln!("correlation={:.4} rms_ratio={:.4}", corr, ratio);
+        assert!(sub_nz > 0, "forward produced all zeros");
     }
 
     #[test]

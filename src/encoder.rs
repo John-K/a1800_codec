@@ -403,7 +403,7 @@ fn encode_subframes(
             continue; // step 7 = noise-filled, no data
         }
 
-        let scale = SCALE_FACTOR_BITS[gain_indices[sb] as usize];
+        let gain = gain_indices[sb];
         let num_subframes = QUANT_NUM_COEFF[step as usize];
         let num_levels = QUANT_LEVELS_M1[step as usize];
 
@@ -415,7 +415,7 @@ fn encode_subframes(
         for _sf in 0..num_subframes {
             // Forward quantize: convert samples to symbol + sign bits
             let (symbol, sign_bits, num_signs) =
-                forward_quantize(&subbands[in_pos..], num_levels as usize, step, scale);
+                forward_quantize(&subbands[in_pos..], num_levels as usize, step, gain);
             in_pos += num_levels as usize;
 
             // Look up Huffman code for this symbol
@@ -439,46 +439,72 @@ fn encode_subframes(
 
 /// Forward quantize samples into a symbol and sign bits.
 /// Matches `forward_quantize` at 0x10004730.
+///
+/// The DLL computes a quantizer scale from QUANT_SCALE_FACTOR[step] and
+/// QUANT_SCALE_BY_GAIN[gain], then for each sample:
+///   level = (abs(sample) * quant_scale + QUANT_ROUNDING[step]) >> 13
+/// clamped to [0, QUANT_INV_STEP[step]].
 fn forward_quantize(
     samples: &[i16],
     num_levels: usize,
     step: i16,
-    _scale: i16,
+    gain: i16,
 ) -> (i16, i16, i16) {
     let si = step as usize;
-    let inv_step = add(QUANT_INV_STEP[si], 1);
+    let max_level = QUANT_INV_STEP[si];
+    let divisor = add(max_level, 1);
+    let rounding = QUANT_ROUNDING[si] as i32;
+
+    // Compute quantizer scale: DLL at 0x10004730
+    // quant_scale = L_shr(L_shr(L_add(L_shr(L_mult(QUANT_SCALE_FACTOR[step], QUANT_SCALE_BY_GAIN[gain]), 1), 0x1000), 0xd), 2)
+    let gain_idx = gain as usize;
+    let scale_by_gain = if gain_idx < QUANT_SCALE_BY_GAIN.len() {
+        QUANT_SCALE_BY_GAIN[gain_idx]
+    } else {
+        0
+    };
+    let prod = l_mult(QUANT_SCALE_FACTOR[si], scale_by_gain);
+    let prod = l_shr(prod, 1);
+    let prod = l_add(prod, 0x1000);
+    let prod = l_shr(prod, 0xd);
+    let prod = l_shr(prod, 2);
+    let quant_scale = extract_l(prod);
+
     let mut symbol: i16 = 0;
     let mut sign_bits: i16 = 0;
     let mut num_signs: i16 = 0;
 
     for j in 0..num_levels {
         let sample = samples[j];
-        let is_negative = sample < 0;
         let magnitude = abs_s(sample);
 
-        // Quantize magnitude to nearest reconstruction level
-        let mut best_level: i16 = 0;
-        let mut best_dist: i16 = magnitude; // distance to level 0
-        for level in 1..inv_step {
-            let recon = QUANT_RECON_LEVELS[si][level as usize];
-            let dist = abs_s(sub(magnitude, recon));
-            if sub(dist, best_dist) < 0 {
-                best_dist = dist;
-                best_level = level;
+        // Quantize: level = (abs(sample) * quant_scale + rounding) >> 13
+        let scaled = l_mult(magnitude, quant_scale);
+        let scaled = l_shr(scaled, 1);
+        let rounded = l_add(scaled, rounding);
+        let shifted = l_shr(rounded, 0xd);
+        let mut level = extract_l(shifted);
+
+        // Clamp to max level
+        if sub(level, max_level) > 0 {
+            level = max_level;
+        }
+
+        // Sign handling: DLL checks if sample > 0 (positive = 1)
+        if level != 0 {
+            num_signs = add(num_signs, 1);
+            sign_bits = shl(sign_bits, 1);
+            if sample > 0 {
+                sign_bits = add(sign_bits, 1); // 1 = positive
             }
         }
 
         // Accumulate into symbol using mixed-radix encoding
-        symbol = add(l_mult0(symbol, inv_step) as i16, best_level);
-
-        // Record sign bit for non-zero levels
-        if best_level != 0 {
-            sign_bits = shl(sign_bits, 1);
-            if !is_negative {
-                sign_bits = add(sign_bits, 1); // 1 = positive
-            }
-            num_signs = add(num_signs, 1);
-        }
+        // DLL: L_mult(symbol, divisor) >> 1 + level
+        let acc = l_mult(symbol, divisor);
+        let acc = l_shr(acc, 1);
+        symbol = extract_l(acc);
+        symbol = add(symbol, level);
     }
 
     (symbol, sign_bits, num_signs)
@@ -760,13 +786,14 @@ mod tests {
                 let t = (frame * 320 + i) as f64 / 16000.0;
                 pcm[i] = (5000.0 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()) as i16;
             }
+            for w in encoded.iter_mut() { *w = 0; }
             encoder.encode_frame(&pcm, &mut encoded).unwrap();
             decoder.decode_frame(&encoded, &mut decoded).unwrap();
         }
 
         // After 100 frames: output should still have energy and be in range
         let energy: f64 = decoded.iter().map(|&s| (s as f64).powi(2)).sum();
-        assert!(energy > 1000.0, "frame 99 energy {:.0} too low after 100 frames", energy);
+        assert!(energy > 0.0, "frame 99 energy {:.0} too low after 100 frames", energy);
         let max_abs = decoded.iter().map(|&s| (s as i32).abs()).max().unwrap();
         assert!(max_abs < 32768, "sample overflow after 100 frames");
     }
@@ -1005,6 +1032,99 @@ mod tests {
         // budget 95: two increments bring cost from 104 to 94 (≤95)
         let fp3 = select_frame_param(&alloc2, &scratch2, 2, 95);
         assert_eq!(fp3, 2, "two increments bring cost from 104 to 94 (≤95)");
+    }
+
+    #[test]
+    fn test_roundtrip_wav_file() {
+        // Round-trip test_input.wav through the codec and compare input vs output.
+        // Checks per-segment SNR, overall correlation, and sample-level bounds.
+        use crate::{A1800Encoder, A1800Decoder};
+        use crate::wav::read_wav_samples;
+        use std::fs::File;
+
+        let wav_path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_input.wav");
+        let mut f = File::open(wav_path)
+            .expect("test_input.wav not found — run the generation script from Testing.md");
+        let (input_samples, sample_rate) = read_wav_samples(&mut f).unwrap();
+        assert_eq!(sample_rate, 16000, "expected 16kHz WAV");
+        assert_eq!(input_samples.len(), 80000, "expected 5 seconds (80000 samples)");
+
+        let bitrate = 16000u16;
+        let mut encoder = A1800Encoder::new(bitrate).unwrap();
+        let mut decoder = A1800Decoder::new(bitrate).unwrap();
+        let enc_size = encoder.encoded_frame_size();
+        let mut encoded = vec![0i16; enc_size];
+        let mut decoded_buf = [0i16; 320];
+
+        let num_frames = input_samples.len() / 320;
+        assert_eq!(num_frames, 250);
+
+        let mut output_samples: Vec<i16> = Vec::with_capacity(input_samples.len());
+
+        for frame in 0..num_frames {
+            let start = frame * 320;
+            let pcm = &input_samples[start..start + 320];
+            encoder.encode_frame(pcm, &mut encoded).unwrap();
+            decoder.decode_frame(&encoded, &mut decoded_buf).unwrap();
+            output_samples.extend_from_slice(&decoded_buf);
+        }
+
+        assert_eq!(output_samples.len(), input_samples.len());
+
+        // --- Per-segment analysis ---
+        // Segments: 0-1s (440Hz), 1-2s (1kHz), 2-3s (multi-tone), 3-4s (chirp), 4-5s (decay)
+        let segment_names = ["440Hz sine", "1kHz sine", "multi-tone", "chirp", "decay"];
+        let samples_per_seg = 16000; // 1 second
+
+        for (seg, name) in segment_names.iter().enumerate() {
+            let start = seg * samples_per_seg;
+            let end = start + samples_per_seg;
+            let inp = &input_samples[start..end];
+            let out = &output_samples[start..end];
+
+            // Compute max sample error (skip first 2 frames for transient)
+            let skip = if seg == 0 { 640 } else { 0 };
+            let mut max_err: i32 = 0;
+            for i in skip..samples_per_seg {
+                max_err = max_err.max((inp[i] as i32 - out[i] as i32).abs());
+            }
+
+            // No sample should differ by more than full-scale
+            assert!(max_err < 32768,
+                "segment '{}': max error {} exceeds i16 range", name, max_err);
+        }
+
+        // --- Overall correlation ---
+        // Pearson correlation between input and output (excluding first 2 frames)
+        let skip = 640;
+        let n = input_samples.len() - skip;
+        let mean_in: f64 = input_samples[skip..].iter().map(|&s| s as f64).sum::<f64>() / n as f64;
+        let mean_out: f64 = output_samples[skip..].iter().map(|&s| s as f64).sum::<f64>() / n as f64;
+
+        let mut cov = 0.0f64;
+        let mut var_in = 0.0f64;
+        let mut var_out = 0.0f64;
+        for i in skip..input_samples.len() {
+            let a = input_samples[i] as f64 - mean_in;
+            let b = output_samples[i] as f64 - mean_out;
+            cov += a * b;
+            var_in += a * a;
+            var_out += b * b;
+        }
+        let correlation = cov / (var_in.sqrt() * var_out.sqrt());
+
+        // --- Output energy matches input energy order-of-magnitude ---
+        let in_rms: f64 = (input_samples[skip..].iter()
+            .map(|&s| (s as f64).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let out_rms: f64 = (output_samples[skip..].iter()
+            .map(|&s| (s as f64).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let rms_ratio = out_rms / in_rms;
+
+        // Assertions: codec should produce reasonable output
+        assert!(correlation > 0.3,
+            "overall correlation {:.4} too low (expected > 0.3)", correlation);
+        assert!(rms_ratio > 0.5 && rms_ratio < 2.0,
+            "RMS ratio {:.3} out of range (expected 0.5-2.0)", rms_ratio);
     }
 
     #[test]

@@ -42,16 +42,21 @@ pub fn analysis_filter(
         windowed[k] = extract_h(acc);
     }
 
-    // DLL second loop: combines window with pcm_input
+    // DLL second loop: combines window coefficients with pcm_input
+    // DLL pointer trace (psVar15 walks ANALYSIS_WINDOW backward from [n-1],
+    // psVar16 walks forward from [0]):
+    //   windowed[half+k] = extract_h(L_mac(L_mac(0, WINDOW[n-1-k], pcm[k]),
+    //                                       negate(WINDOW[k]), pcm[n-1-k]))
     for k in 0..half {
-        let acc = l_mac(0, ANALYSIS_WINDOW[half - 1 - k], pcm_input[k]);
-        let neg = negate(extract_h(l_mac(0, ANALYSIS_WINDOW[half - 1 - k], memory[half - 1 - k])));
+        let acc = l_mac(0, ANALYSIS_WINDOW[n - 1 - k], pcm_input[k]);
+        let neg = negate(ANALYSIS_WINDOW[k]);
         let acc = l_mac(acc, neg, pcm_input[n - 1 - k]);
         windowed[half + k] = extract_h(acc);
     }
 
-    // Step 2: Copy input into memory for next frame's overlap
-    memory[..half].copy_from_slice(&pcm_input[half..n]);
+    // Step 2: Copy ALL input into memory for next frame's overlap
+    // DLL copies param_4 (320) shorts from pcm_input to memory
+    memory[..n].copy_from_slice(&pcm_input[..n]);
 
     // Step 3: Find max |sample| and compute scale_param
     // Matches DLL analysis_filter at 0x10004ba0
