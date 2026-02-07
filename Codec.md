@@ -225,8 +225,19 @@ PCM → Analysis Filter → Gain Encode → Bit Allocation → Subframe Encode �
 ### 5.1. Analysis Filter (`analysis_filter` / DLL 0x10004ba0)
 
 Converts 320 PCM samples to 320 subband samples + returns `scale_param`:
-1. Calls `forward_filterbank(pcm_input, g_enc_filterbank_memory, subband_buf, 320)`
-2. Computes `scale_param` from the subband energy distribution
+
+1. **Windowed overlap** using ANALYSIS_WINDOW (320 entries at 0x10010718):
+   - First 160 outputs: symmetric window applied to memory buffer
+     `windowed[k] = extract_h(L_mac(L_mac(0, WINDOW[159-k], memory[159-k]), WINDOW[160+k], memory[160+k]))`
+   - Second 160 outputs: window applied to pcm_input with memory subtraction
+     `windowed[160+k] = extract_h(L_mac(L_mac(0, WINDOW[159-k], pcm[k]), neg, pcm[319-k]))`
+2. Copy pcm_input[160..320] into memory for next frame's overlap
+3. **Compute scale_param** from max absolute windowed value:
+   - If max_abs >= 14000 → sp = 0
+   - Else: `adj = max_abs` (or +1 if < 0x1b6), `val = extract_l(L_shr(L_mult(adj, 0x2573), 0x14))`, `sp = norm_s(val) - 6` (or 9 if norm_s returns 0)
+   - Sum-of-abs check: if `max_abs < L_shr(sum_of_abs, 7)`, decrement sp
+4. **Apply scaling**: if sp > 0 → shl; if sp < 0 → shr
+5. **Forward filterbank** to produce subbands
 
 ### 5.2. Forward Filterbank (`forward_filterbank` / DLL 0x10002280)
 
@@ -285,6 +296,8 @@ enc_frame(pcm_input, output_bitstream) → 0
 
 All tables were extracted from the DLL's .rdata section via Ghidra memory inspection.
 
+### Decoder Tables
+
 | Table                 | Address      | Size      | Purpose                                      |
 |-----------------------|-------------|-----------|----------------------------------------------|
 | BIT_ALLOC_COST        | 0x1000d9f0  | 8 i16     | Cost in bits per quantizer step (0–7)        |
@@ -296,15 +309,34 @@ All tables were extracted from the DLL's .rdata section via Ghidra memory inspec
 | QUANT_RECON_LEVELS    | 0x1000d8f0  | 8×16 i16  | Reconstruction levels per step                |
 | GAIN_HUFFMAN_TREE     | 0x1000d3e8  | 300×2 i16 | 13 sections × 23 nodes, binary tree           |
 | COSINE_MOD_MATRIX     | 0x1000bed0  | 320 i16   | First 100 = 10×10 cosine matrix; rest unused  |
-| FILTERBANK_COEFF_0    | 0x1000C498  | 20 i16    | Reconstruction stage 4 coefficients           |
-| FILTERBANK_COEFF_1    | 0x1000C4C0  | 40 i16    | Reconstruction stage 3 coefficients           |
-| FILTERBANK_COEFF_2    | 0x1000C510  | 80 i16    | Reconstruction stage 2 coefficients           |
-| FILTERBANK_COEFF_3    | 0x1000C5B0  | 160 i16   | Reconstruction stage 3 coefficients           |
-| FILTERBANK_COEFF_4    | 0x1000C6F0  | 320 i16   | Reconstruction stage 0 coefficients           |
-| FILTERBANK_COEFF_5    | 0x1000C970  | 640 i16   | Encoder-only (not used in decoder)            |
+| FILTERBANK_COEFF_0    | 0x1000C498  | 20 i16    | Inverse reconstruction stage 4 coefficients   |
+| FILTERBANK_COEFF_1    | 0x1000C4C0  | 40 i16    | Inverse reconstruction stage 3 coefficients   |
+| FILTERBANK_COEFF_2    | 0x1000C510  | 80 i16    | Inverse reconstruction stage 2 coefficients   |
+| FILTERBANK_COEFF_3    | 0x1000C5B0  | 160 i16   | Inverse reconstruction stage 1 coefficients   |
+| FILTERBANK_COEFF_4    | 0x1000C6F0  | 320 i16   | Inverse reconstruction stage 0 coefficients   |
 | CODEBOOK_TREE_0..6    | various     | various   | 7 Huffman codebook trees for quantizer steps  |
 | SYNTH_OVERLAP_OFFSETS | 0x10010998  | 320 i16   | Synthesis window coefficients (monotonic rise) |
 | Coeff pointer table   | 0x1000ce70  | 6 ptrs    | Pointers to FILTERBANK_COEFF_0..5             |
+
+### Encoder Tables
+
+| Table                   | Address      | Size      | Purpose                                       |
+|-------------------------|-------------|-----------|-----------------------------------------------|
+| FWD_COSINE_MOD_MATRIX   | 0x1000bb88  | 100 i16   | Forward filterbank 10×10 cosine matrix        |
+| FWD_FILTERBANK_COEFF_0  | 0x1000b198  | 20 i16    | Forward reconstruction stage 4                |
+| FWD_FILTERBANK_COEFF_1  | 0x1000b1c0  | 40 i16    | Forward reconstruction stage 3                |
+| FWD_FILTERBANK_COEFF_2  | 0x1000b210  | 80 i16    | Forward reconstruction stage 2                |
+| FWD_FILTERBANK_COEFF_3  | 0x1000b2b0  | 160 i16   | Forward reconstruction stage 1                |
+| FWD_FILTERBANK_COEFF_4  | 0x1000b3f0  | 320 i16   | Forward reconstruction stage 0                |
+| FWD_FILTERBANK_COEFF_5  | 0x1000b670  | 640 i16   | Forward reconstruction extended (stage 0)     |
+| GAIN_HUFFMAN_BIT_WIDTHS | 0x1000cea8  | 336 i16   | Gain differential Huffman widths (14×24)      |
+| GAIN_HUFFMAN_CODES      | 0x1000d148  | 336 i16   | Gain differential Huffman codes (14×24)       |
+| ANALYSIS_WINDOW         | 0x10010718  | 320 i16   | Analysis filter window coefficients           |
+| QUANT_SCALE_FACTOR      | 0x100106a8  | 8 i16     | Forward quantizer scale factors               |
+| QUANT_SCALE_BY_GAIN     | 0x10010628  | 64 i16    | Gain-to-scale multiplier lookup               |
+| QUANT_ROUNDING          | 0x100106f8  | 8 i16     | Quantizer rounding offsets                    |
+| FWD_CODEBOOK_CODES_0..6 | various     | various   | 7 Huffman code tables for forward quantizer   |
+| FWD_CODEBOOK_WIDTHS_0..6| various     | various   | 7 Huffman width tables for forward quantizer  |
 
 ### SCALE_FACTOR_BITS Structure
 
@@ -361,11 +393,11 @@ All arithmetic matches ITU-T G.729 basic operations. Key functions:
 | decode_frame_params             | 0x10002f60 | decoder.rs::decode_frame_params |
 | decode_gains                    | 0x10003050 | decoder.rs::decode_gains      |
 | read_bit                        | 0x10003820 | bitstream.rs::read_bit        |
-| compute_bit_alloc_for_frame     | 0x10001d30 | decoder.rs::compute_bit_alloc_for_frame |
-| search_bit_allocation_threshold | 0x100020f0 | decoder.rs::search_threshold  |
-| compute_bit_allocation          | 0x10002200 | decoder.rs::compute_allocation |
-| optimize_bit_allocation         | 0x10001dc0 | decoder.rs::optimize_allocation |
-| increment_allocation_bins       | 0x10003290 | decoder.rs::increment_allocation_bins |
+| compute_bit_alloc_for_frame     | 0x10001d30 | decoder.rs::compute_bit_alloc_for_frame (shared with encoder) |
+| search_bit_allocation_threshold | 0x100020f0 | decoder.rs::search_threshold (shared) |
+| compute_bit_allocation          | 0x10002200 | decoder.rs::compute_allocation (shared) |
+| optimize_bit_allocation         | 0x10001dc0 | decoder.rs::optimize_allocation (shared) |
+| increment_allocation_bins       | 0x10003290 | decoder.rs::increment_allocation_bins (shared) |
 | decode_subframes                | 0x100032e0 | decoder.rs::decode_subframes  |
 | inverse_quantize                | 0x10003760 | decoder.rs::inverse_quantize  |
 | noise_prng                      | 0x10003870 | decoder.rs::noise_prng        |
@@ -375,20 +407,18 @@ All arithmetic matches ITU-T G.729 basic operations. Key functions:
 
 ### Encoder Functions
 
-| DLL Function                    | Address     | Description                                   |
+| DLL Function                    | Address     | Rust Location                                 |
 |---------------------------------|------------|-----------------------------------------------|
-| a1800_enc_frame_init            | 0x100038c0 | Validate bitrate, set globals, zero memory    |
-| enc_frame_init                  | 0x100039a0 | Wrapper: inits + returns frame sizes          |
-| a1800_enc_frame                 | 0x10003a20 | Per-frame encode (analysis → encode_frame)    |
-| enc_frame                       | 0x100039d0 | Wrapper: analysis_filter + encode_frame       |
-| analysis_filter                 | 0x10004ba0 | PCM → subbands (forward filterbank + scaling) |
-| forward_filterbank              | 0x10002280 | Forward 5-stage butterfly + cosine mod        |
-| encode_frame                    | 0x10003ad0 | Encode subbands to bitstream                  |
-| encode_gains                    | 0x100040b0 | Compute gain indices + Huffman encode         |
-| prescale_subbands               | 0x10003fe0 | Normalize subbands by gain                    |
-| encode_subframes                | 0x100043e0 | Quantize + encode per-subband samples         |
-| forward_quantize                | 0x10004730 | Forward quantizer for one subband             |
-| write_bitstream                 | 0x10003c30 | Pack gains + subframe data into output words  |
+| a1800_enc_frame_init            | 0x100038c0 | encoder.rs::EncoderState::new                 |
+| enc_frame                       | 0x100039d0 | encoder.rs::encode_frame_to_bitstream         |
+| analysis_filter                 | 0x10004ba0 | analysis.rs::analysis_filter                  |
+| forward_filterbank              | 0x10002280 | filterbank.rs::forward                        |
+| encode_frame                    | 0x10003ad0 | encoder.rs::encode_frame                      |
+| encode_gains                    | 0x100040b0 | encoder.rs::encode_gains                      |
+| prescale_subbands               | 0x10003fe0 | encoder.rs::prescale_subbands                 |
+| encode_subframes                | 0x100043e0 | encoder.rs::encode_subframes                  |
+| forward_quantize                | 0x10004730 | encoder.rs::forward_quantize                  |
+| write_bitstream                 | 0x10003c30 | encoder.rs::write_bitstream                   |
 
 ### DLL API Exports
 
@@ -449,10 +479,10 @@ Initially extracted as 32 entries. The gain decoder accesses indices up to ~53 (
 - **What frame sizes other than 320 are valid?** The filterbank has a `frame_size` parameter and special-cases 320 with a final ×2 scaling. Other sizes may exist but are untested.
 
 ### Encoder Side
-- **The encoder is not implemented in Rust**, but all DLL encoder functions have been identified and their roles understood (see Section 8).
-- **FILTERBANK_COEFF_5** (640 entries at 0x1000C970): Used by the forward filterbank encoder. The forward filterbank uses a separate coefficient pointer table at `FWD_FILTERBANK_COEFF_PTRS` (0x1000bb70) and a different cosine modulation matrix at `FWD_COSINE_MOD_MATRIX` (0x1000bb88). Unlike the decoder's `FILTERBANK_COEFF_PTRS` (0x1000ce70) which has 6 entries (5 used), the forward table structure needs further investigation.
-- **How does the encoder decide the 4-bit frame parameter?** The `encode_subframes` function (0x100043e0) uses `optimize_bit_allocation`'s swap log to iteratively adjust bit allocation. The 4-bit frame parameter encodes the number of swap operations from the optimization phase that should be replayed on the decoder side.
-- **Forward filterbank differences from inverse**: The forward filterbank (0x10002280) uses `L_shr` before `L_add/L_sub` in its butterfly stages (vs. inverse which uses `L_add` then `L_shr`). The reconstruction phase omits the `L_shl(1)` that the inverse uses. The cosine modulation uses `extract_h(acc)` directly (no `L_shr(acc, 1)`).
+- **The encoder is implemented in Rust** and round-trip works for bitrates 4800–24000 bps. The 32000 bps rate has a known limitation where the forward quantizer produces all-zero symbols due to the analysis filter's windowed overlap not perfectly matching the DLL's complex pointer arithmetic.
+- **FILTERBANK_COEFF_5** (640 entries at 0x1000C970): Used by the forward filterbank's stage 0 reconstruction. The forward filterbank uses 6 coefficient tables (FWD_FILTERBANK_COEFF_0..5) vs. the inverse's 5 (FILTERBANK_COEFF_0..4). FWD_COEFF_5 has double the entries of COEFF_4 (640 vs 320).
+- **The 4-bit frame parameter** encodes the number of swap operations from `optimize_bit_allocation`'s swap log that should be replayed on the decoder side.
+- **Encoder scale_param consistency**: The encoder computes scale_param from the analysis filter, but must also recompute it from gain indices using the decoder's algorithm (`compute_scale_param_from_gains`) so the encoder and decoder agree on the value.
 
 ### Bit Allocation
 - **Why the budget cap at 320?** The budget adjustment formula `((excess - 320) * 5) >> 3 + 320` limits effective bits, but the rationale is unclear.
@@ -491,19 +521,14 @@ Initially extracted as 32 entries. The gain decoder accesses indices up to ~53 (
   - Full struct layout is not mapped
 
 ### Bit-Exactness
-- **Has the decoder been validated against the DLL's output?** No. All code was written from decompiled pseudocode. True bit-exact verification requires:
-  1. Real .a18 test files
-  2. Reference output from the DLL (e.g., running it via Wine or on Windows)
-  3. Sample-by-sample comparison
+- **Has the decoder been validated against the DLL's output?** Not directly against the DLL. Round-trip testing (encode → decode) validates internal consistency: silence, DC, sine wave, and multi-frame tests pass. True bit-exact verification against the DLL still requires real .a18 test files and reference output.
 - **The PRNG initialization** [1, 1, 1, 1] was read from the DLL's init function. If this is wrong, all noise-filled subbands will differ.
 
-### Encoder Implementation (Rust — not started)
-- All encoder DLL functions have been identified and parameter-named in Ghidra (see Section 8).
-- `analysis_filter` (0x10004ba0): Calls `forward_filterbank` then computes `scale_param` — full decompilation available but not yet traced in detail.
-- `encode_gains` (0x100040b0): Computes per-subband energy (sum of squares via `L_mac0`), log-scale gain, differential Huffman encoding using `GAIN_HUFFMAN_BIT_WIDTHS` (0x1000cea8) and `GAIN_HUFFMAN_CODES` (0x1000d148).
-- `prescale_subbands` (0x10003fe0): Right-shifts subband samples proportional to gain index, normalizing them before quantization.
-- `forward_quantize` (0x10004730): Converts normalized subband samples into Huffman-coded symbols — the inverse of `inverse_quantize`.
-- `write_bitstream` (0x10003c30): Packs gain codes, frame parameter, and encoded subband data into 16-bit output words.
+### Encoder Implementation Details
+- `encode_gains` (0x100040b0): gain_index = `0xB + shift_count - 2*scale_param`, where shift_count comes from norm_s of subband energy. Backward smoothing clamps first gain to [-6, 24] and differentials to [-15, 24] before Huffman encoding.
+- `prescale_subbands` (0x10003fe0): For each subband with gain > 0x27: `shift = shr(gain - 0x27, 1)`, then `sample = extract_l(L_shr(L_shr(L_add(L_shl(sample, 16), 0x8000), shift), 16))`. This is a right-shift with rounding, NOT multiplication by SCALE_FACTOR_BITS.
+- `forward_quantize` (0x10004730): Quantizes normalized samples against QUANT_RECON_LEVELS thresholds, producing Huffman symbol indices. Uses FWD_CODEBOOK_CODES/WIDTHS tables (7 tables for steps 0–6).
+- `analysis_filter` scale_param: Uses `L_mult(adj, 0x2573) → L_shr(,0x14) → norm_s`, NOT direct `norm_s(max_abs)`.
 
 ---
 
@@ -511,18 +536,20 @@ Initially extracted as 32 entries. The gain decoder accesses indices up to ~53 (
 
 ```
 src/
-├── main.rs          CLI: a1800_codec decode <input.a18> <output.wav>
-├── lib.rs           Public API: A1800Decoder
+├── main.rs          CLI: a1800_codec decode/encode
+├── lib.rs           Public API: A1800Decoder + A1800Encoder
 ├── fixedpoint.rs    ITU-T G.729-style basic operations (25 functions)
-├── bitstream.rs     MSB-first bit reader from 16-bit LE words
+├── bitstream.rs     MSB-first bit reader/writer from 16-bit LE words
 ├── decoder.rs       Frame decoder: gains, bit allocation, subframe decode
-├── filterbank.rs    5-stage butterfly + cosine mod + reconstruction
+├── encoder.rs       Frame encoder: gains, bit allocation, forward quantize, bitstream write
+├── filterbank.rs    5-stage butterfly + cosine mod + reconstruction (inverse + forward)
+├── analysis.rs      Analysis filter: windowed overlap + forward filterbank + scale_param
 ├── synthesis.rs     Inverse filterbank + scaling + overlap-add
-├── tables.rs        All constant tables from the DLL
-└── wav.rs           Mono 16-bit PCM WAV writer
+├── tables.rs        All constant tables from the DLL (decoder + encoder)
+└── wav.rs           Mono 16-bit PCM WAV reader + writer
 ```
 
-25 tests cover: fixed-point ops (9), bitstream reader (4), decoder core (6), filterbank (3), synthesis (2), WAV writer (1).
+44 tests cover: fixed-point ops (9), bitstream reader/writer (7), decoder core (6), encoder core + round-trip (11), filterbank (4), synthesis (2), analysis (1), WAV reader/writer (2), CLI (2).
 
 ---
 
@@ -530,6 +557,8 @@ src/
 
 ```
 a1800_codec decode <input.a18> <output.wav> [--sample-rate N]
+a1800_codec encode <input.wav> <output.a18> [--bitrate N]
 ```
 
-Default sample rate is 16000 Hz. The decoder reads the bitrate from the .a18 header.
+Decode: reads bitrate from the .a18 header, default sample rate 16000 Hz.
+Encode: default bitrate 16000 bps, supports 4800–24000 (32000 has known limitation).
