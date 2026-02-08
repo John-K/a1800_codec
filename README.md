@@ -1,4 +1,5 @@
 # a1800_codec
+![a1800_codec PyPi](https://img.shields.io/pypi/v/a1800_codec)
 
 A Rust encoder and decoder for the GeneralPlus A1800 audio codec, reverse-engineered from `A1800.DLL`.
 
